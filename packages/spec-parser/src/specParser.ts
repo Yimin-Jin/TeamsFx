@@ -32,8 +32,8 @@ import { AdaptiveCardGenerator } from "./adaptiveCardGenerator";
 import { wrapAdaptiveCard } from "./adaptiveCardWrapper";
 import { ValidatorFactory } from "./validators/validatorFactory";
 import { Validator } from "./validators/validator";
-import { PluginManifestSchema } from "@microsoft/teams-manifest";
 import { createHash } from "crypto";
+import { $RefParser } from "@apidevtools/json-schema-ref-parser";
 
 /**
  * A class that parses an OpenAPI specification file and provides methods to validate, list, and generate artifacts.
@@ -47,6 +47,8 @@ export class SpecParser {
   private spec: OpenAPIV3.Document | undefined;
   private unResolveSpec: OpenAPIV3.Document | undefined;
   private isSwaggerFile: boolean | undefined;
+
+  private readonly refParser;
 
   private defaultOptions: ParseOptions = {
     allowMissingId: true,
@@ -71,6 +73,7 @@ export class SpecParser {
   constructor(pathOrDoc: string | OpenAPIV3.Document, options?: ParseOptions) {
     this.pathOrSpec = pathOrDoc;
     this.parser = new SwaggerParser();
+    this.refParser = new $RefParser();
     this.options = {
       ...this.defaultOptions,
       ...(options ?? {}),
@@ -88,11 +91,14 @@ export class SpecParser {
 
       try {
         await this.loadSpec();
-        if (!this.parser.$refs.circular) {
+        if (!this.refParser.$refs.circular) {
           await this.parser.validate(this.spec!);
         } else {
+          // The following code hangs for Graph API, support will be added when SwaggerParser is updated.
+          /*
           const clonedUnResolveSpec = JSON.parse(JSON.stringify(this.unResolveSpec));
           await this.parser.validate(clonedUnResolveSpec);
+          */
         }
       } catch (e) {
         return {
@@ -123,7 +129,7 @@ export class SpecParser {
       }
 
       // Remote reference not supported
-      const refPaths = this.parser.$refs.paths();
+      const refPaths = this.refParser.$refs.paths();
       // refPaths [0] is the current spec file path
       if (refPaths.length > 1) {
         errors.push({
@@ -274,7 +280,7 @@ export class SpecParser {
       }
 
       const clonedUnResolveSpec = JSON.parse(JSON.stringify(newUnResolvedSpec));
-      const newSpec = (await this.parser.dereference(clonedUnResolveSpec)) as OpenAPIV3.Document;
+      const newSpec = await this.deReferenceSpec(clonedUnResolveSpec);
       return [newUnResolvedSpec, newSpec];
     } catch (err) {
       if (err instanceof SpecParserError) {
@@ -282,6 +288,11 @@ export class SpecParser {
       }
       throw new SpecParserError((err as Error).toString(), ErrorType.GetSpecFailed);
     }
+  }
+
+  private async deReferenceSpec(spec: any): Promise<OpenAPIV3.Document> {
+    const result = await this.refParser.dereference(spec);
+    return result as OpenAPIV3.Document;
   }
 
   /**
@@ -309,7 +320,37 @@ export class SpecParser {
       const newUnResolvedSpec = newSpecs[0];
       const newSpec = newSpecs[1];
 
-      const authInfo = Utils.getAuthInfo(newSpec);
+      const paths = newUnResolvedSpec.paths;
+      for (const pathUrl in paths) {
+        const operations = paths[pathUrl];
+        for (const method in operations) {
+          const operationItem = (operations as any)[method] as OpenAPIV3.OperationObject;
+          const operationId = operationItem.operationId!;
+
+          const containsSpecialCharacters = /[^a-zA-Z0-9_]/.test(operationId);
+          if (containsSpecialCharacters) {
+            operationItem.operationId = operationId.replace(/[^a-zA-Z0-9]/g, "_");
+            result.warnings.push({
+              type: WarningType.OperationIdContainsSpecialCharacters,
+              content: Utils.format(
+                ConstantString.OperationIdContainsSpecialCharacters,
+                operationId,
+                operationItem.operationId
+              ),
+              data: operationId,
+            });
+          }
+
+          const authArray = Utils.getAuthArray(operationItem.security, newSpec);
+          if (Utils.isNotSupportedAuth(authArray)) {
+            result.warnings.push({
+              type: WarningType.UnsupportedAuthType,
+              content: Utils.format(ConstantString.AuthTypeIsNotSupported, operationId),
+              data: operationId,
+            });
+          }
+        }
+      }
 
       await this.saveFilterSpec(outputSpecPath, newUnResolvedSpec);
 
@@ -323,6 +364,8 @@ export class SpecParser {
             specPath: this.pathOrSpec as string,
           }
         : undefined;
+
+      const authMap = Utils.getAuthMap(newSpec);
       const [updatedManifest, apiPlugin, warnings] =
         await ManifestUpdater.updateManifestWithAiPlugin(
           manifestPath,
@@ -330,7 +373,7 @@ export class SpecParser {
           pluginFilePath,
           newSpec,
           this.options,
-          authInfo,
+          authMap,
           existingPluginManifestInfo
         );
 
@@ -385,7 +428,9 @@ export class SpecParser {
             if (this.options.allowMethods.includes(method)) {
               const operation = (newSpec.paths[url] as any)[method] as OpenAPIV3.OperationObject;
               try {
-                const [card, jsonPath] = AdaptiveCardGenerator.generateAdaptiveCard(operation);
+                const [card, jsonPath, jsonData, warnings] =
+                  AdaptiveCardGenerator.generateAdaptiveCard(operation);
+                result.warnings.push(...warnings);
                 const safeAdaptiveCardName = operation.operationId!.replace(/[^a-zA-Z0-9]/g, "_");
                 const fileName = path.join(adaptiveCardFolder, `${safeAdaptiveCardName}.json`);
                 const wrappedCard = wrapAdaptiveCard(card, jsonPath);
@@ -394,7 +439,7 @@ export class SpecParser {
                   adaptiveCardFolder,
                   `${safeAdaptiveCardName}.data.json`
                 );
-                await fs.outputJSON(dataFileName, {}, { spaces: 2 });
+                await fs.outputJSON(dataFileName, jsonData, { spaces: 2 });
               } catch (err) {
                 result.allSuccess = false;
                 result.warnings.push({
@@ -446,7 +491,8 @@ export class SpecParser {
       }
 
       const clonedUnResolveSpec = JSON.parse(JSON.stringify(this.unResolveSpec));
-      this.spec = (await this.parser.dereference(clonedUnResolveSpec)) as OpenAPIV3.Document;
+
+      this.spec = await this.deReferenceSpec(clonedUnResolveSpec);
     }
   }
 

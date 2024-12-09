@@ -8,11 +8,12 @@ import { CreateOauthArgs } from "../interface/createOauthArgs";
 import { FeatureFlags, featureFlagManager } from "../../../../common/featureFlags";
 import { OpenAPIV3 } from "openapi-types";
 import { isEqual } from "lodash";
-import { maxDomainPerOauth } from "./constants";
+import { maxDomainPerOauth, maxSecretLength, minSecretLength } from "./constants";
 import { OauthDomainInvalidError } from "../error/oauthDomainInvalid";
 import { OauthFailedToGetDomainError } from "../error/oauthFailedToGetDomain";
 import { OauthAuthInfoInvalid } from "../error/oauthAuthInfoInvalid";
 import { UpdateOauthArgs } from "../interface/updateOauthArgs";
+import { OauthAuthMissingInSpec } from "../error/oauthAuthMissingInSpec";
 
 export interface OauthInfo {
   domain: string[];
@@ -20,6 +21,7 @@ export interface OauthInfo {
   tokenExchangeEndpoint?: string;
   tokenRefreshEndpoint?: string;
   scopes?: string[];
+  clientId?: string;
 }
 
 interface AuthInfo {
@@ -50,6 +52,10 @@ export async function getandValidateOauthInfoFromSpec(
     const auth = value.auth;
     return auth && auth.authScheme.type === "oauth2" && auth.name === args.name;
   });
+
+  if (operations.length === 0) {
+    throw new OauthAuthMissingInSpec(actionName, args.name);
+  }
 
   const domains = operations
     .map((value) => {
@@ -98,12 +104,24 @@ export async function getandValidateOauthInfoFromSpec(
   };
 }
 
+export function validateSecret(clientSecret: string): boolean {
+  if (typeof clientSecret !== "string") {
+    return false;
+  }
+
+  if (clientSecret.length > maxSecretLength || clientSecret.length < minSecretLength) {
+    return false;
+  }
+
+  return true;
+}
+
 function validateDomain(domain: string[], actionName: string): void {
   if (domain.length > maxDomainPerOauth) {
     throw new OauthDomainInvalidError(actionName);
   }
 
-  if (domain.length === 0) {
+  if (domain.length === 0 || domain.includes("")) {
     throw new OauthFailedToGetDomainError(actionName);
   }
 }

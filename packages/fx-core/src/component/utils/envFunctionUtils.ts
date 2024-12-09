@@ -15,7 +15,6 @@ import stripBom from "strip-bom";
 import { FileNotFoundError } from "../../error";
 import { expandEnvironmentVariable } from "./common";
 import { getLocalizedString } from "../../common/localizeUtils";
-import { featureFlagManager, FeatureFlags } from "../../common/featureFlags";
 import { DriverContext } from "../driver/interface/commonArgs";
 
 const source = "ResolveManifestFunction";
@@ -42,9 +41,6 @@ export async function expandVariableWithFunction(
   manifestType: ManifestType,
   fromPath: string
 ): Promise<Result<string, FxError>> {
-  if (!featureFlagManager.getBooleanValue(FeatureFlags.EnvFileFunc)) {
-    return ok(content);
-  }
   const regex = /\$\[ *[a-zA-Z][a-zA-Z]*\([^\]]*\) *\]/g;
   const matches = content.match(regex);
 
@@ -138,7 +134,7 @@ async function readFileContent(
   fromPath: string
 ): Promise<Result<string, FxError>> {
   const ext = path.extname(filePath);
-  if (ext.toLowerCase() !== ".txt") {
+  if (ext.toLowerCase() !== ".txt" && ext.toLowerCase() !== ".md") {
     ctx.logProvider.error(
       getLocalizedString("core.envFunc.unsupportedFile.errorLog", filePath, "txt")
     );
@@ -150,7 +146,8 @@ async function readFileContent(
     try {
       let fileContent = await fs.readFile(absolutePath, "utf8");
       fileContent = stripBom(fileContent);
-      const processedFileContent = expandEnvironmentVariable(fileContent, envs);
+      let processedFileContent = expandEnvironmentVariable(fileContent, envs);
+      processedFileContent = processedFileContent.replace(/\r\n/g, "\n");
       return ok(processedFileContent);
     } catch (e) {
       ctx.logProvider.error(

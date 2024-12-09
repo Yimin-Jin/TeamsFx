@@ -3,8 +3,8 @@
 import * as util from "util";
 import * as vscode from "vscode";
 
-import { FxError, Result, SystemError, err, ok } from "@microsoft/teamsfx-api";
-import { assembleError } from "@microsoft/teamsfx-core";
+import { FxError, Result, SystemError, UserError, err, ok } from "@microsoft/teamsfx-api";
+import { assembleError, globalStateGet, globalStateUpdate } from "@microsoft/teamsfx-core";
 import { UserCancelError, sleep } from "@microsoft/vscode-ui";
 import VsCodeLogInstance from "../commonlib/log";
 import { ExtTelemetry } from "../telemetry/extTelemetry";
@@ -17,10 +17,18 @@ import {
 import { getTriggerFromProperty } from "../utils/telemetryUtils";
 import { localize } from "../utils/localizeUtils";
 import { showOutputChannelHandler } from "./showOutputChannel";
-import { InstallCopilotChatLink } from "../constants";
+import { GlobalKey, InstallCopilotChatLink } from "../constants";
 import { isVSCodeInsiderVersion } from "../utils/versionUtil";
+import { VS_CODE_UI } from "../qm/vsc_ui";
 
 const githubCopilotChatExtensionId = "github.copilot-chat";
+const teamsAgentLink = "https://aka.ms/install-teamsapp";
+
+enum errorNames {
+  NoActiveTextEditor = "NoActiveTextEditor",
+  CannotVerifyGithubCopilotChat = "CannotVerifyGithubCopilotChat",
+  openCopilotError = "openCopilotError",
+}
 
 function githubCopilotInstalled(): boolean {
   const extension = vscode.extensions.getExtension(githubCopilotChatExtensionId);
@@ -40,7 +48,7 @@ async function openGithubCopilotChat(query: string): Promise<Result<null, FxErro
   } catch (e) {
     const error = new SystemError(
       eventName,
-      "openCopilotError",
+      errorNames.openCopilotError,
       util.format(localize("teamstoolkit.handlers.chatTeamsAgentError", query)),
       util.format(localize("teamstoolkit.handlers.chatTeamsAgentError", query))
     );
@@ -58,17 +66,17 @@ async function openGithubCopilotChat(query: string): Promise<Result<null, FxErro
 
 export async function installGithubCopilotChatExtension(
   triggerFrom: TelemetryTriggerFrom
-): Promise<Result<any, FxError>> {
-  const eventName = "installCopilotChat";
+): Promise<Result<null, FxError>> {
+  const startEventName = "install-copilot-chat-start";
+  const eventName = "install-copilot-chat";
   const telemetryProperties = {
     [TelemetryProperty.TriggerFrom]: triggerFrom,
   };
-  ExtTelemetry.sendTelemetryEvent(eventName, telemetryProperties);
+  ExtTelemetry.sendTelemetryEvent(startEventName, telemetryProperties);
   try {
     const confirmRes = await vscode.window.showInformationMessage(
       localize("teamstoolkit.handlers.askInstallCopilot"),
-      localize("teamstoolkit.handlers.askInstallCopilot.install"),
-      localize("teamstoolkit.handlers.askInstallCopilot.cancel")
+      localize("teamstoolkit.handlers.askInstallCopilot.install")
     );
 
     if (confirmRes !== localize("teamstoolkit.handlers.askInstallCopilot.install")) {
@@ -111,27 +119,74 @@ export async function installGithubCopilotChatExtension(
   }
 }
 
-export async function invokeTeamsAgent(args?: any[]): Promise<Result<null, FxError>> {
-  const eventName = TelemetryEvent.InvokeTeamsAgent;
-  const triggerFromProperty = getTriggerFromProperty(args);
-  ExtTelemetry.sendTelemetryEvent(eventName, triggerFromProperty);
+export async function handleInstallTeamsAgentSelection(
+  selection: string | undefined,
+  telemetryProperties: {
+    [key: string]: string;
+  }
+) {
+  const eventName = "install-teams-agent-notification";
+  const selectionTelemetryPropertyName = "selection";
+  if (selection === localize("teamstoolkit.handlers.askInstallTeamsAgent.install")) {
+    const installTelemetryProperties = {
+      ...telemetryProperties,
+      [selectionTelemetryPropertyName]: "install",
+    };
+    const openUrlRes = await VS_CODE_UI.openUrl(teamsAgentLink);
+    if (openUrlRes.isOk()) {
+      ExtTelemetry.sendTelemetryEvent(eventName, {
+        ...installTelemetryProperties,
+      });
+    } else {
+      ExtTelemetry.sendTelemetryErrorEvent(eventName, openUrlRes.error, installTelemetryProperties);
+      VsCodeLogInstance.error(openUrlRes.error.message);
+    }
+  } else if (selection === localize("teamstoolkit.handlers.askInstallTeamsAgent.confirmInstall")) {
+    ExtTelemetry.sendTelemetryEvent(eventName, {
+      ...telemetryProperties,
+      [selectionTelemetryPropertyName]: "confirmed",
+    });
+    await globalStateUpdate(GlobalKey.DoNotRemindInstallTeamsAgent, true);
+  } else {
+    const error = new UserCancelError(eventName, "cancel");
+    ExtTelemetry.sendTelemetryErrorEvent(eventName, error, telemetryProperties);
+  }
+}
 
-  const query =
-    triggerFromProperty["trigger-from"] === TelemetryTriggerFrom.TreeView ||
-    triggerFromProperty["trigger-from"] === TelemetryTriggerFrom.CommandPalette
-      ? "@teamsapp Use this GitHub Copilot extension to ask questions about Teams app development."
-      : "@teamsapp Find relevant templates or samples to build your Teams app as per your description. E.g. @teamsapp create an AI assistant bot that can complete common tasks.";
-  let res;
+async function invoke(
+  query: string,
+  eventName: string,
+  triggerFromProperty: { [key: string]: TelemetryTriggerFrom }
+): Promise<Result<null, FxError>> {
+  const skipRemindInstallTeamsAgent = await globalStateGet(
+    GlobalKey.DoNotRemindInstallTeamsAgent,
+    false
+  );
+  if (!skipRemindInstallTeamsAgent) {
+    void vscode.window
+      .showInformationMessage(
+        localize("teamstoolkit.handlers.askInstallTeamsAgent"),
+        localize("teamstoolkit.handlers.askInstallTeamsAgent.install"),
+        localize("teamstoolkit.handlers.askInstallTeamsAgent.confirmInstall")
+      )
+      .then(async (selection) => {
+        await handleInstallTeamsAgentSelection(selection, triggerFromProperty);
+      });
+  }
 
   const isExtensionInstalled = githubCopilotInstalled();
   if (isExtensionInstalled) {
-    res = await openGithubCopilotChat(query);
+    VsCodeLogInstance.info(
+      util.format(localize("teamstoolkit.handlers.installAgent.output"), teamsAgentLink)
+    );
+    showOutputChannelHandler();
+    return await openGithubCopilotChat(query);
   } else {
     VsCodeLogInstance.info(
       util.format(
-        localize("teamstoolkit.handlers.installExtension.output"),
-        "GitHub Copilot Chat",
-        InstallCopilotChatLink
+        localize("teamstoolkit.handlers.installCopilotAndAgent.output"),
+        InstallCopilotChatLink,
+        teamsAgentLink
       )
     );
     showOutputChannelHandler();
@@ -155,11 +210,11 @@ export async function invokeTeamsAgent(args?: any[]): Promise<Result<null, FxErr
 
       if (verifyExtensionInstalled) {
         await sleep(2000); // wait for extension activation
-        res = await openGithubCopilotChat(query);
+        return await openGithubCopilotChat(query);
       } else {
         const error = new SystemError(
           eventName,
-          "CannotVerifyGithubCopilotChat",
+          errorNames.CannotVerifyGithubCopilotChat,
           util.format(
             localize("teamstoolkit.handlers.verifyCopilotExtensionError", InstallCopilotChatLink)
           ),
@@ -168,18 +223,132 @@ export async function invokeTeamsAgent(args?: any[]): Promise<Result<null, FxErr
           )
         );
         VsCodeLogInstance.error(error.message);
-        res = err(error);
+        return err(error);
       }
     } else {
-      res = installRes;
+      return installRes;
     }
   }
+}
+
+/**
+ * Invokes GitHub Copilot Chat for creating new app or development questions.
+ * @param args args
+ * @returns Result
+ */
+export async function invokeTeamsAgent(args?: any[]): Promise<Result<null, FxError>> {
+  const eventName = TelemetryEvent.InvokeTeamsAgent;
+  const triggerFromProperty = getTriggerFromProperty(args);
+  ExtTelemetry.sendTelemetryEvent(TelemetryEvent.InvokeTeamsAgentStart, triggerFromProperty);
+
+  const query =
+    triggerFromProperty["trigger-from"] === TelemetryTriggerFrom.TreeView ||
+    triggerFromProperty["trigger-from"] === TelemetryTriggerFrom.CommandPalette
+      ? "@teamsapp Use this GitHub Copilot extension to ask questions about Teams app and agent development."
+      : "@teamsapp Write your own query message to find relevant templates or samples to build your Teams app and agent as per your description. E.g. @teamsapp create an AI assistant bot that can complete common tasks.";
+  const res = await invoke(query, eventName, triggerFromProperty);
+
   if (res.isErr()) {
     ExtTelemetry.sendTelemetryErrorEvent(eventName, res.error, triggerFromProperty);
   } else {
     ExtTelemetry.sendTelemetryEvent(eventName, {
       [TelemetryProperty.Success]: TelemetrySuccess.Yes,
       ...triggerFromProperty,
+    });
+  }
+  return res;
+}
+
+/**
+ * Invokes teams agent for troubleshooting based on selected text.
+ * @param args
+ * @returns Result
+ */
+export async function troubleshootSelectedText(args?: any[]): Promise<Result<null, FxError>> {
+  const eventName = TelemetryEvent.TroubleshootSelectedText;
+  const triggerFromProperty = getTriggerFromProperty([TelemetryTriggerFrom.EditorContextMenu]);
+  ExtTelemetry.sendTelemetryEvent(
+    TelemetryEvent.TroubleshootSelectedTextStart,
+    triggerFromProperty
+  );
+
+  const editor = vscode.window.activeTextEditor;
+  let selectedText = "";
+  if (editor) {
+    const selection = editor.selection;
+    selectedText = editor.document.getText(selection);
+  } else {
+    return err(
+      new UserError(
+        eventName,
+        errorNames.NoActiveTextEditor,
+        localize("teamstoolkit.handlers.teamsAgentTroubleshoot.noActiveEditor")
+      )
+    );
+  }
+
+  const query = `@teamsapp I'm encountering an issue in Teams Toolkit.
+\`\`\`
+{
+  Error context: ${selectedText}
+}
+\`\`\`
+Can you help me diagnose the issue and suggest possible solutions?
+`;
+  const res = await invoke(query, eventName, triggerFromProperty);
+
+  if (res.isErr()) {
+    ExtTelemetry.sendTelemetryErrorEvent(eventName, res.error, triggerFromProperty);
+  } else {
+    ExtTelemetry.sendTelemetryEvent(eventName, {
+      [TelemetryProperty.Success]: TelemetrySuccess.Yes,
+      ...triggerFromProperty,
+    });
+  }
+  return res;
+}
+
+/**
+ * Invokes teams agent for troubleshooting current error.
+ * @param args
+ * @returns Result
+ */
+export async function troubleshootError(args?: any[]): Promise<Result<null, FxError>> {
+  const eventName = TelemetryEvent.TroubleshootErrorFromNotification;
+  if (!args || args.length !== 2) {
+    // should never happen
+    return ok(null);
+  }
+
+  const currentError = args[1] as FxError;
+  const errorCode = `${currentError.source}.${currentError.name}`;
+  const triggerFromProperty = getTriggerFromProperty(args);
+  const telemtryProperties = {
+    ...triggerFromProperty,
+    [TelemetryProperty.ErrorCode]: errorCode,
+  };
+  ExtTelemetry.sendTelemetryEvent(
+    TelemetryEvent.TroubleshootErrorFromNotificationStart,
+    telemtryProperties
+  );
+
+  const query = `@teamsapp I'm encountering the following error in Teams Toolkit.
+  \`\`\`
+  {
+    Error code: ${errorCode}
+    Error message: ${currentError.message}
+  }
+  \`\`\`
+  Can you help me diagnose the issue and suggest possible solutions?
+  `;
+  const res = await invoke(query, eventName, triggerFromProperty);
+
+  if (res.isErr()) {
+    ExtTelemetry.sendTelemetryErrorEvent(eventName, res.error, telemtryProperties);
+  } else {
+    ExtTelemetry.sendTelemetryEvent(eventName, {
+      [TelemetryProperty.Success]: TelemetrySuccess.Yes,
+      ...telemtryProperties,
     });
   }
   return res;

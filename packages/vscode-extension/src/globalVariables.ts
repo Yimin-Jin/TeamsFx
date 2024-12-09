@@ -32,6 +32,31 @@ export let core: FxCore;
 export let tools: Tools;
 export let diagnosticCollection: vscode.DiagnosticCollection; // Collection of diagnositcs after running app validation.
 export let deleteAadInProgress = false;
+export let outputTroubleshootNotificationCount = 0;
+
+export interface ILocalDebugPorts {
+  checkPorts: number[];
+  conflictPorts: number[];
+  terminateButton: string;
+  process2conflictPorts: Record<string, number[]>;
+  terminateProcesses: string[];
+}
+
+export const LocalDebugPorts: ILocalDebugPorts = {
+  checkPorts: [],
+  conflictPorts: [],
+  terminateButton: "",
+  process2conflictPorts: {},
+  terminateProcesses: [],
+};
+
+export function resetLocalDebugPorts() {
+  LocalDebugPorts.checkPorts = [];
+  LocalDebugPorts.conflictPorts = [];
+  LocalDebugPorts.terminateButton = "";
+  LocalDebugPorts.process2conflictPorts = {};
+  LocalDebugPorts.terminateProcesses = [];
+}
 
 if (vscode.workspace && vscode.workspace.workspaceFolders) {
   if (vscode.workspace.workspaceFolders.length > 0) {
@@ -41,6 +66,7 @@ if (vscode.workspace && vscode.workspace.workspaceFolders) {
 
 export function initializeGlobalVariables(ctx: vscode.ExtensionContext): void {
   context = ctx;
+  outputTroubleshootNotificationCount = 0;
   isExistingUser = context.globalState.get<string>(UserState.IsExisting) || "no";
   isTeamsFxProject = isValidProject(workspaceUri?.fsPath);
   isOfficeAddInProject = isValidOfficeAddInProject(workspaceUri?.fsPath);
@@ -114,4 +140,8 @@ export function setDiagnosticCollection(collection: vscode.DiagnosticCollection)
 
 export function setDeleteAadInProgress(inProgress: boolean) {
   deleteAadInProgress = inProgress;
+}
+
+export function setOutputTroubleshootNotificationCount(value: number) {
+  outputTroubleshootNotificationCount = value;
 }
